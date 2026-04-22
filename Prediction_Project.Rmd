@@ -1,0 +1,223 @@
+---
+title: "Prediction Project"
+author: "HaiyanChen"
+date: "2026-04-21"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+## Overview
+This report focuses on developing a predictive model based on accelerometer data collected from sensors placed on the belt, forearm, arm, and dumbbell. Model performance is evaluated using cross-validation and appropriate error metrics. The final model is then applied to predict outcomes for 20 unseen test cases.
+
+## Download data
+```{r download_data, echo = TRUE}
+setwd("E:/coursera_temporary/quiz_environment")
+
+# Download training file
+fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(fileUrl,destfile="E:/coursera_temporary/Practical_Machine_Learning/training.csv",method="curl")
+
+# Download testing file
+fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(fileUrl,destfile="E:/coursera_temporary/Practical_Machine_Learning/testing.csv",method="curl")
+
+# Read data into R
+training = read.csv("E:/coursera_temporary/Practical_Machine_Learning/training.csv")
+testing = read.csv("E:/coursera_temporary/Practical_Machine_Learning/testing.csv")
+```
+
+## Data cleaning
+```{r data_cleaning, echo = TRUE, results = "hide", warning = FALSE}
+# Load packages
+library(caret)
+library(caretEnsemble)
+
+# 1. Convert empty strings to NA
+training[training == ""] <- NA
+testing[testing == ""] <- NA
+
+# 2. Remove high-NA variables
+na_ratio <- sapply(training, function(x) mean(is.na(x)))
+training_clean <- training[, na_ratio < 0.95]
+
+# 3. Remove irrelevant columns
+training_clean <- training_clean[, !(names(training_clean) %in% c(
+  "X", "user_name",
+  "raw_timestamp_part_1", "raw_timestamp_part_2",
+  "cvtd_timestamp", "new_window", "num_window"
+))]
+
+# 4. Define predictors (IMPORTANT FIX)
+predictor_names <- setdiff(names(training_clean), "classe")
+
+# keep only variables that also exist in testing (SAFE FIX)
+predictor_names <- predictor_names[predictor_names %in% names(testing)]
+
+# 5. Align testing dataset (FIXED)
+testing_clean <- testing[, predictor_names, drop = FALSE]
+```
+
+## Train-test split (for model evaluation ONLY)
+```{r train_test_split, echo = TRUE}
+set.seed(125)
+inTrain <- createDataPartition(training_clean$classe, p = 0.7, list = FALSE)
+
+train_split <- training_clean[inTrain, ]
+test_split  <- training_clean[-inTrain, ]
+```
+
+## Cross-validation setup
+```{r cross_validation_setup, echo = TRUE, results = "hide"}
+set.seed(125)  # Set seed for reproducibility
+
+control <- trainControl(
+  method = "cv",                 # Use cross-validation
+  number = 5,                    # Number of folds (5-fold CV)
+  savePredictions = "final",     # Save CV predictions (required for stacking)
+  classProbs = TRUE              # Calculate class probabilities
+)
+```
+
+## Train models
+```{r train_model, echo = TRUE, results = "hide"}
+model_list <- caretList(
+  classe ~ .,                  # Predict Class using all predictors
+  data =  train_split,            # Training dataset
+  trControl = control,        # Cross-validation settings
+  methodList = c("rpart", "rf", "gbm")  # Models: decision tree, random forest, GBM
+)
+```
+
+## Stacking model
+```{r stacking_model, echo = TRUE, results = "hide"}
+stack_model <- caretStack(
+  model_list,                                   # Base models to combine
+  method = "rf",                                # Use random forest as meta-model
+  trControl = trainControl(method = "cv", number = 5)  # Cross-validation for stacking
+)
+```
+
+## Model evaluation (VALIDATION SET ONLY)
+In this part, we will evaluate the pre-built models (rpart, rf, gbm) on the validation set (test_split) , which was held out from the training data. Based on their accuracy scores, we will identify the best-performing model.
+```{r model_evaluation, echo = TRUE}
+# check the class of test_split$classe 
+# Ensure it is a factor variable so that it has levels
+class(test_split$classe)
+ 
+# Convert test_split$classe to factor 
+# Convert test_split$classe to factor 
+test_split$classe <- factor(test_split$classe)
+
+# Get base model predictions
+pred_rpart <- predict(model_list$rpart, test_split)
+pred_rf <- predict(model_list$rf, test_split)
+pred_gbm <- predict(model_list$gbm, test_split)
+
+# Get stacking model predictions
+pred_stack_raw <- predict(stack_model, test_split)
+
+# Debug: Check what we got
+cat("=== Debug Information ===\n")
+cat("Class of pred_stack_raw:", class(pred_stack_raw), "\n")
+
+if (is.matrix(pred_stack_raw)) {
+  cat("Dimensions:", dim(pred_stack_raw), "\n")
+  cat("Column names:", colnames(pred_stack_raw), "\n")
+}
+
+# Fix: Convert to single vector of class labels
+if (is.matrix(pred_stack_raw)) {
+  # If it's a probability matrix (samples × classes)
+  if (ncol(pred_stack_raw) == 5) {
+    # Convert probabilities to class labels
+    pred_stack <- colnames(pred_stack_raw)[max.col(pred_stack_raw)]
+    cat("Converted probability matrix to classes\n")
+  } else {
+    # If it's already a matrix but not probabilities
+    pred_stack <- as.vector(pred_stack_raw[, 1])
+  }
+} else if (is.data.frame(pred_stack_raw)) {
+  # If it's a data frame
+  if (ncol(pred_stack_raw) == 5) {
+    pred_stack <- colnames(pred_stack_raw)[max.col(pred_stack_raw)]
+  } else {
+    pred_stack <- pred_stack_raw[, 1]
+  }
+} else {
+  # If it's already a vector
+  pred_stack <- pred_stack_raw
+}
+
+# Verify lengths after conversion
+cat("\nLength after conversion:\n")
+cat("test_split$classe:", length(test_split$classe), "\n")
+cat("pred_stack:", length(pred_stack), "\n")
+
+# Force same factor levels
+target_levels <- levels(test_split$classe)
+pred_rpart <- factor(pred_rpart, levels = target_levels)
+pred_rf <- factor(pred_rf, levels = target_levels)
+pred_gbm <- factor(pred_gbm, levels = target_levels)
+pred_stack <- factor(pred_stack, levels = target_levels)
+
+# Now create confusion matrices
+cm_rpart <- confusionMatrix(pred_rpart, test_split$classe)
+cm_rf <- confusionMatrix(pred_rf, test_split$classe)
+cm_gbm <- confusionMatrix(pred_gbm, test_split$classe)
+cm_stack <- confusionMatrix(pred_stack, test_split$classe)
+
+# Combine results
+accuracy_compare <- data.frame(
+  Model = c("rpart", "rf", "gbm", "stacking"),
+  Accuracy = c(
+    cm_rpart$overall["Accuracy"],
+    cm_rf$overall["Accuracy"],
+    cm_gbm$overall["Accuracy"],
+    cm_stack$overall["Accuracy"]
+  ),
+  CI_Lower = c(
+    cm_rpart$overall["AccuracyLower"],
+    cm_rf$overall["AccuracyLower"],
+    cm_gbm$overall["AccuracyLower"],
+    cm_stack$overall["AccuracyLower"]
+  ),
+  CI_Upper = c(
+    cm_rpart$overall["AccuracyUpper"],
+    cm_rf$overall["AccuracyUpper"],
+    cm_gbm$overall["AccuracyUpper"],
+    cm_stack$overall["AccuracyUpper"]
+  ),
+  P_Value = c(
+    cm_rpart$overall["AccuracyPValue"],
+    cm_rf$overall["AccuracyPValue"],
+    cm_gbm$overall["AccuracyPValue"],
+    cm_stack$overall["AccuracyPValue"]
+  )
+)
+
+# Print comparison table
+print(accuracy_compare)
+
+# Find and display the best model
+best <- accuracy_compare[which.max(accuracy_compare$Accuracy), ]
+cat("\n===== Best Model =====\n")
+cat("Model:", best$Model, "\n")
+cat("Accuracy:", round(best$Accuracy, 4), "\n")
+cat("95% CI: [", round(best$CI_Lower, 4), ",", round(best$CI_Upper, 4), "]\n")
+cat("P-value:", format(best$P_Value, scientific = TRUE), "\n")
+```
+According to the result, the best model is `r best$Model`, with the largest accuracy `r round(best$Accuracy, 4)` (95% CI: `r round(best$CI_Lower, 4)` to `r round(best$CI_Upper, 4)`).
+
+## Final prediction
+Finally, we use the best model (`r best$Model`) to predict the testing clean dataset.
+```{r final_prediction, echo = TRUE, results = "hide"}
+final_pred <- predict(stack_model, testing_clean)
+
+results <- data.frame(
+  problem_id = testing$problem_id, 
+  classe = final_pred
+)
+
+results
+```
